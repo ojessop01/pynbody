@@ -80,13 +80,45 @@ class GrafICSnap(SimSnap):
         self.properties['boxsize'] = boxsize * units.Unit("Mpc a")
 
     def _derive_mass(self):
+        """
+        Derive particle masses.
+    
+        If an ic_massc file exists, it is interpreted as a spatially varying
+        CDM fraction field f_cdm(x). Particle masses are modulated relative
+        to the mean such that a spatially constant field reproduces the
+        uniform-mass case exactly.
+        """
+    
+        # Box and cosmology
         boxsize = self._header['dx'] * self._header['nx']
         rho = analysis.cosmology.rho_M(self, unit='Msol Mpc^-3 a^-3')
-        tot_mass = rho * boxsize ** 3  # in Msol
-        part_mass = tot_mass / self._header['nx'] ** 3
+        tot_mass = rho * boxsize**3
+        mean_part_mass = tot_mass / self._header['nx']**3
+    
         self._create_array('mass')
-        self['mass'][:] = part_mass
         self['mass'].units = "Msol"
+    
+        filename = os.path.join(self._filename, "ic_massc")
+    
+        if os.path.exists(filename):
+            frac_cdm = np.empty(self._num_particles, dtype=np.float32)
+            self._read_grafic_file(filename, frac_cdm, _float_data_type)
+    
+            if not np.all(np.isfinite(frac_cdm)):
+                raise ValueError("ic_massc contains non-finite values")
+    
+            mean_frac = np.mean(frac_cdm)
+    
+            if mean_frac <= 0.0:
+                raise ValueError("Mean CDM fraction must be positive")
+    
+            # Normalised modulation
+            self['mass'][:] = mean_part_mass * (frac_cdm / mean_frac)
+    
+        else:
+            # Uniform-mass fallback
+            self['mass'][:] = mean_part_mass
+
 
     def _derive_pos(self):
         self._setup_pos_grid()
@@ -169,6 +201,15 @@ class GrafICSnap(SimSnap):
         self._create_array('iord',dtype=_int_data_type)
         self._read_grafic_file(filename, self['iord'], _int_data_type)
 
+    def _read_deltac(self):
+        # this is a proprietary extension to the grafic format used by genetIC
+        filename = os.path.join(self._filename, 'ic_deltac')
+        if not os.path.exists(filename):
+            raise OSError("No deltac array")
+    
+        self._create_array('deltac', dtype=_float_data_type)
+        self._read_grafic_file(filename, self['deltac'], _float_data_type)
+
     def _read_deltab(self):
         # this is a proprietary extension to the grafic format used by genetIC
         filename = os.path.join(self._filename, 'ic_deltab')
@@ -220,24 +261,27 @@ class GrafICSnap(SimSnap):
                         ))
                 target_buffer[mem_index] = sliced_data[buf_index]
 
-    def _load_array(self, name, fam=None):
+      def _load_array(self, name, fam=None):
+  
+      if fam is not family.dm and fam is not None:
+          raise OSError("Only DM particles supported")
+  
+      if name == "mass":
+          self._derive_mass()
+      elif name == "pos":
+          self._derive_pos()
+      elif name == "vel":
+          self._derive_vel()
+      elif name == "iord":
+          self._read_iord()
+      elif name == "deltab":
+          self._read_deltab()
+      elif name == "deltac":
+          self._read_deltac()
+      elif name == "refmap":
+          self._read_refmap()
+      elif name == "pvar":
+          self._read_pvar()
+      else:
+          raise OSError("No such array")
 
-        if fam is not family.dm and fam is not None:
-            raise OSError("Only DM particles supported")
-
-        if name == "mass":
-            self._derive_mass()
-        elif name == "pos":
-            self._derive_pos()
-        elif name == "vel":
-            self._derive_vel()
-        elif name=="iord":
-            self._read_iord()
-        elif name=="deltab":
-            self._read_deltab()
-        elif name == "refmap":
-            self._read_refmap()
-        elif name == "pvar":
-            self._read_pvar()
-        else:
-            raise OSError("No such array")
