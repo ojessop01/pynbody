@@ -25,6 +25,7 @@ import os
 import struct
 import sys
 import warnings
+import zlib
 
 import numpy as np
 
@@ -66,22 +67,7 @@ class TipsySnap(SimSnap):
         if not only_header:
             logger.info("Loading %s", filename)
         with util.open_(filename, 'rb') as f:
-            t, n, ndim, ng, nd, ns,pad = struct.unpack("diiiiii", f.read(32))
-            if (ndim > 3 or ndim < 1):
-                self._byteswap = True
-                f.seek(0)
-                t, n, ndim, ng, nd, ns,pad = struct.unpack(">diiiiii", f.read(32))
-            else:
-                self._byteswap = False
-
-            assert ndim == 3
-            if (n == 0 or n != ng+nd+ns):
-                n += ((pad & 0x000000ff) << 32)
-                ng += ((pad & 0x0000ff00) << 24)
-                nd += ((pad & 0x00ff0000) << 16)
-                ns += ((pad & 0xff000000) << 8)
-            assert n == ng+nd+ns
-
+            t, n, ng, nd, ns, self._byteswap = self._parse_header(f.read(32))
             self._header_t = t
 
 
@@ -135,7 +121,38 @@ class TipsySnap(SimSnap):
             pass
 
         if time_unit is not None:
-            self.properties['time'] *= time_unit
+            # Store as a SimArray (raw value + unit label) rather than folding the
+            # conversion into a bare Unit, consistent with how every other time-valued
+            # quantity (e.g. star['tform']) is represented. This keeps the raw,
+            # file-native value recoverable (needed so _write can round-trip it) while
+            # still allowing sim.properties['time'].in_units(...) to give the physical
+            # value, and lets it interoperate directly with other time SimArrays.
+            self.properties['time'] = array.SimArray(self.properties['time'], time_unit)
+
+    @staticmethod
+    def _parse_header(header):
+        """Parse the 32-byte tipsy header, returning (t, n, ng, nd, ns, byteswap).
+
+        Raises ValueError if the header is not that of a valid tipsy file."""
+        if len(header) != 32:
+            raise ValueError("Tipsy header is too short")
+        t, n, ndim, ng, nd, ns, pad = struct.unpack("diiiiii", header)
+        if (ndim > 3 or ndim < 1):
+            byteswap = True
+            t, n, ndim, ng, nd, ns, pad = struct.unpack(">diiiiii", header)
+        else:
+            byteswap = False
+
+        if ndim != 3:
+            raise ValueError("Tipsy header does not specify 3 dimensions")
+        if (n == 0 or n != ng+nd+ns):
+            n += ((pad & 0x000000ff) << 32)
+            ng += ((pad & 0x0000ff00) << 24)
+            nd += ((pad & 0x00ff0000) << 16)
+            ns += ((pad & 0xff000000) << 8)
+        if n != ng+nd+ns:
+            raise ValueError("Tipsy header particle numbers are inconsistent")
+        return t, n, ng, nd, ns, byteswap
 
     def _load_main_file(self):
 
@@ -151,38 +168,45 @@ class TipsySnap(SimSnap):
                 self._create_array(w, ndim, zeros=False)
                 write.append(w)
 
-        for w in "rho", "temp":
-            if w not in list(self.gas.keys()):
-                self.gas._create_array(w, zeros=False)
-                write.append(w)
-
-        if ("metals" not in list(self.gas.keys())) and ("metals" not in list(self.star.keys())):
-            self.gas._create_array("metals", zeros=False)
-            self.star._create_array("metals", zeros=False)
-            write.append("metals")
-
-        if "tform" not in list(self.star.keys()):
-            self.star._create_array("tform", zeros=False)
-            write.append("tform")
-
-        if "temp" in write:
-            self.gas["temp"].units = "K"
-
         for k in "pos", "vel", "mass", "eps", "phi":
             if k in write:
                 self[k].set_default_units(quiet=True)
+
+        if 'gas' in self.families():
+            for w in "rho", "temp":
+                if w not in list(self.gas.keys()):
+                    self.gas._create_array(w, zeros=False)
+                    write.append(w)
+
+            if "metals" not in list(self.gas.keys()):
+                self.gas._create_array("metals", zeros=False)
+                write.append("metals")
+
+            if "temp" in write:
+                self.gas["temp"].units = "K"
+
+            for k in "rho", "temp", "metals":
+                if k in write:
+                    self.gas[k].set_default_units(quiet=True)
+
+        if 'star' in self.families():
+            if "metals" not in list(self.star.keys()):
+                self.star._create_array("metals", zeros=False)
+                if "metals" not in write:
+                    write.append("metals")
+
+            if "tform" not in list(self.star.keys()):
+                self.star._create_array("tform", zeros=False)
+                write.append("tform")
+
+            for k in "metals", "tform":
+                if k in write:
+                    self.star[k].set_default_units(quiet=True)
 
         # only do this for cosmo runs
         if "phi" in write and 'h' in self.properties:
             self['phi'].units = self['phi'].units * units.a ** -3  # messy :-(
 
-        for k in "rho", "temp", "metals":
-            if k in write:
-                self.gas[k].set_default_units(quiet=True)
-
-        for k in "metals", "tform":
-            if k in write:
-                self.star[k].set_default_units(quiet=True)
 
         if "pos" in write:
             write += ['x', 'y', 'z']
@@ -209,7 +233,7 @@ class TipsySnap(SimSnap):
                 if self._byteswap:
                     buf = buf.byteswap()
 
-                if mem_index is not None:
+                if fam in self.families() and mem_index is not None:
                     # Copy into the correct arrays
                     for name in dtype.names:
                         if name in write:
@@ -217,38 +241,39 @@ class TipsySnap(SimSnap):
 
         f.close()
 
-    def _update_loadable_keys(self):
-        def is_readable_array(x):
-            try:
-                with util.open_(x, 'rt') as f:
-                    return int(f.readline()) == len(self)
-            except ValueError:
-                # could be a binary file
-                with util.open_(x, 'rb') as f:
-                    header = f.read(4)
-                if len(header) != 4:
-                    return False
-
-                if self._byteswap:
-                    buflen = struct.unpack(">i", header)[0]
-                else:
-                    buflen = struct.unpack("i", header)[0]
-
-                ourlen_1 = (self._load_control.disk_num_particles)& 0xffffffff
-                ourlen_3 = (self._load_control.disk_num_particles*3)& 0xffffffff
-
-                if buflen == ourlen_1:  # it's a vector
-                    return True
-                elif buflen == ourlen_3:  # it's an array
-                    return True
-                else:
-                    return False
-
-            except OSError:
+    def _is_readable_array(self, x):
+        """Return True if the file x looks like an auxiliary array of the right length for this snapshot"""
+        try:
+            with util.open_(x, 'rt') as f:
+                return int(f.readline()) == len(self)
+        except ValueError:
+            # could be a binary file
+            with util.open_(x, 'rb') as f:
+                header = f.read(4)
+            if len(header) != 4:
                 return False
 
+            if self._byteswap:
+                buflen = struct.unpack(">i", header)[0]
+            else:
+                buflen = struct.unpack("i", header)[0]
+
+            ourlen_1 = (self._load_control.disk_num_particles)& 0xffffffff
+            ourlen_3 = (self._load_control.disk_num_particles*3)& 0xffffffff
+
+            if buflen == ourlen_1:  # it's a vector
+                return True
+            elif buflen == ourlen_3:  # it's an array
+                return True
+            else:
+                return False
+
+        except OSError:
+            return False
+
+    def _update_loadable_keys(self):
         fs = list(map(util.cutgz, glob.glob(self._filename + ".*")))
-        res = [q[len(self._filename) + 1:] for q in list(filter(is_readable_array, fs))]
+        res = [q[len(self._filename) + 1:] for q in list(filter(self._is_readable_array, fs))]
 
         # Create an empty dictionary of sets to store the loadable
         # arrays for each family
@@ -279,6 +304,21 @@ class TipsySnap(SimSnap):
         else:
             # Return what is loadable to all families
             return list(set.intersection(*list(self._loadable_keys_registry.values())))
+
+    def _has_loadable_key(self, name):
+        if len(self._loadable_keys_registry) > 0:
+            return super()._has_loadable_key(name)
+
+        # Work out the answer by inspecting only the files that could provide this array, rather than
+        # every auxiliary file (see _update_loadable_keys, whose semantics this reproduces)
+        all_fams = set(self.families()) | {f for f in self._basic_loadable_keys if f is not None}
+        fams_with_name = {f for f in all_fams if name in self._basic_loadable_keys.get(f, ())}
+        for d in {name, _translate_array_name(name), _translate_array_name(name, reverse=True)}:
+            if name not in (d, _translate_array_name(d), _translate_array_name(d, reverse=True)):
+                continue
+            if self._is_readable_array(self._filename + "." + d):
+                fams_with_name.update(self._get_loadable_array_metadata(d)[1] or all_fams)
+        return all_fams.issubset(fams_with_name)
 
     def _update_snapshot(self, arrays, filename=None, fam_out=[family.gas, family.dm, family.star]):
         """
@@ -967,11 +1007,10 @@ class TipsySnap(SimSnap):
     @classmethod
     def _can_load(cls, f):
         try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", RuntimeWarning)
-                check = TipsySnap(f)
-            del check
-        except Exception as e:
+            with util.open_(f, 'rb') as fd:
+                cls._parse_header(fd.read(32))
+        except (OSError, EOFError, ValueError, zlib.error):
+            # zlib.error arises from a corrupt .gz file
             return False
 
         return True

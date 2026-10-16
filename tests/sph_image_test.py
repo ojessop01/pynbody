@@ -234,6 +234,24 @@ def test_projection_average(simple_test_file):
 
 
 
+@pytest.mark.parametrize("ny_factor, nz_factor", [(1, 2), (2, 1)])
+def test_3d_grid_non_cubic(simple_test_file, ny_factor, nz_factor):
+    """Check the grid cell size along each axis is set by the matching n, not by ny (issue #1032)"""
+    f = simple_test_file
+    n = 16
+
+    cubic = pynbody.sph.render_3d_grid(f, nx=n, ny=n, nz=n, width=4.0, approximate_fast=False)
+    enlarged = pynbody.sph.render_3d_grid(f, nx=n, ny=ny_factor * n, nz=nz_factor * n, width=4.0,
+                                          approximate_fast=False)
+
+    assert cubic.shape == (n, n, n)
+    assert enlarged.shape == (n, ny_factor * n, nz_factor * n)
+
+    overlap = tuple(slice((factor - 1) * n // 2, (factor + 1) * n // 2)
+                    for factor in (1, ny_factor, nz_factor))
+    npt.assert_allclose(enlarged[overlap], cubic, rtol=1e-5)
+
+
 def test_spherical_render(simple_test_file):
     f = simple_test_file
 
@@ -258,9 +276,87 @@ def test_spherical_render(simple_test_file):
                                      -0.46617195], rtol=0.01)
 
 
+def test_healpix_approximate_not_applied(simple_test_file):
+    """The approximate_fast option must be a no-op for healpix, whether or not the renderer is threaded.
+
+    Regression test: the default pipeline (threaded + approximate) used to wrap the healpix renderer in an
+    ApproximateImageRenderer, which summed identical full-resolution maps and so doubled the result."""
+    f = simple_test_file
+
+    def render(**kwargs):
+        return renderers.make_render_pipeline(f, 'rho', nside=16, target='healpix', **kwargs).render()
+
+    reference = render(approximate_fast=False, threaded=False)
+    assert reference.sum() > 0
+
+    npt.assert_allclose(render(), reference, rtol=1e-6)
+    npt.assert_allclose(render(threaded=False), reference, rtol=1e-6)
+    npt.assert_allclose(render(approximate_fast=False), reference, rtol=1e-6)
+    npt.assert_allclose(render(threaded=True, approximate_fast=True), reference, rtol=1e-6)
+    npt.assert_allclose(render(threaded=False, approximate_fast=True), reference, rtol=1e-6)
+
+    # but explicitly requesting approximation from a healpix renderer is an error
+    for threaded in (False, True):
+        pipeline = renderers.make_render_pipeline(f, 'rho', nside=16, target='healpix', threaded=threaded,
+                                                  approximate_fast=False)
+        with pytest.raises(NotImplementedError):
+            pipeline.with_approximate()
+
+
+def test_spherical_shell_render(simple_test_file):
+    """A thin-shell healpix render should sample the 3D density field, giving volumetric units."""
+    f = simple_test_file
+
+    im = pynbody.sph.render_spherical_image(f, 'rho', nside=16, distance='1.0 kpc')
+
+    # sampling density on a shell gives a volumetric (density) quantity, not a per-solid-angle column
+    assert im.units == "Msol kpc^-3"
+
+    # the shell passes through the bulk of the (unit-variance gaussian) distribution, so it must be
+    # populated with sensible, positive densities
+    assert (im >= 0).all()
+    assert np.count_nonzero(im) > len(im) // 2
+    assert 0.001 < im.mean() < 1.0
+
+
+@pytest.mark.skipif(platform.system() == "Windows", reason="Healpy not supported on Windows")
+def test_spherical_shell_geometry(simple_test_file):
+    """Check the thin-shell geometry against an independent brute-force evaluation on healpix pixels."""
+    import healpy as hp
+
+    f = simple_test_file
+    nside = 16
+    distance = 1.3
+
+    kernel = kernels.CubicSplineKernel()
+    im = pynbody.sph.render_spherical_image(f, 'rho', nside=nside, distance=distance, kernel=kernel)
+
+    pos = f['pos'].view(np.ndarray)
+    h = f['smooth'].view(np.ndarray)
+    mass = f['mass'].view(np.ndarray)
+    rho = f['rho'].view(np.ndarray)
+
+    npix = 12 * nside * nside
+    shell_points = distance * np.array(hp.pix2vec(nside, np.arange(npix))).T  # (npix, 3)
+
+    ref = np.zeros(npix)
+    max_d = kernel.max_d
+    for i in range(len(pos)):
+        d = np.linalg.norm(shell_points - pos[i], axis=1)
+        contributing = np.nonzero(d < max_d * h[i])[0]
+        for p in contributing:
+            # get_value's first argument is the normalised distance q = d / h
+            ref[p] += mass[i] * kernel.get_value(d[p] / h[i], h[i])  # rho * mass / rho = mass
+
+    # residual is dominated by the kernel look-up-table quantisation, matching the accuracy of the
+    # flat-image renderer; require agreement to ~1% of the peak with only the small systematic LUT bias
+    peak = np.abs(ref).max()
+    assert np.abs(im - ref).max() < 0.02 * peak
+    assert np.abs((im - ref).mean()) < 5e-3 * peak
+
+
 @pytest.mark.filterwarnings("ignore::UserWarning")
 @pytest.mark.skipif(platform.system() == "Windows", reason="Healpy not supported on Windows")
-@pytest.mark.skipif(sys.version_info >= (3, 14), reason="Healpy binaries seem to be broken on Python 3.14")
 def test_render_stars_spherical(snap):
     plt.clf()
     res = pynbody.plot.stars.render_mollweide(snap, return_image=True)

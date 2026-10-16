@@ -15,6 +15,14 @@ The :func:`to_3d_grid` function can be used to create a 3D grid of interpolated 
 functionality is also a thin wrapper around the :func:`~pynbody.sph.renderers.make_render_pipeline` function and
 its associated classes in the :mod:`~pynbody.sph.renderers` module.
 
+Underlying all of the above is the :class:`~pynbody.kdtree.KDTree`, which finds the neighbours and provides the
+lower-level SPH operations themselves, such as :meth:`~pynbody.kdtree.KDTree.sph_mean` and
+:meth:`~pynbody.kdtree.KDTree.sph_divergence`. It also supports user-defined SPH operations, which are not
+otherwise available in pynbody: :meth:`~pynbody.kdtree.KDTree.pair_reduce` accumulates an arbitrary pairwise
+function over neighbour pairs, so that operations such as artificial viscosity or conduction can be expressed
+without a python-level loop over particles. For finer control, :meth:`~pynbody.kdtree.KDTree.pair_blocks` exposes
+the neighbour pairs themselves.
+
 """
 
 import copy
@@ -75,8 +83,8 @@ def rho(sim):
 
     logger.info('Calculating SPH density')
     rho = array.SimArray(
-        np.empty(len(sim['pos'])), sim['mass'].units / sim['pos'].units ** 3,
-        dtype=sim['pos'].dtype)
+        np.empty(len(sim['pos']), dtype=sim['pos'].dtype),
+        sim['mass'].units / sim['pos'].units ** 3)
 
 
     start = time.time()
@@ -94,15 +102,23 @@ def rho(sim):
     return rho
 
 def render_spherical_image(snap, quantity='rho', nside=None, kernel=None, denoise=None, out_units=None, threaded=None,
-                           weight=None, qty=None):
-    """Render an SPH image projected onto the sky around the origin.
+                           weight=None, distance=None, qty=None):
+    """Render an SPH image onto the sky around the origin, in healpix format with the specified nside.
 
-    At present, only projection is supported (i.e., there is no implementation for rendering on a spherical
-    shell). For example, if rendering density, the results are in units of mass per solid angle. The image is
-    returned in healpix format, with the specified nside.
+    By default the image is projected onto the sky, i.e. integrated along the line of sight. For example, if
+    rendering density, the results are then in units of mass per solid angle.
+
+    Alternatively, if ``distance`` is provided, a thin spherical shell is sampled at that radius using the full 3D
+    kernel. The result then carries volumetric units (e.g. a density, if rendering density) rather than a
+    per-solid-angle column.
 
     Weighted projections are supported, e.g. one may look at the projected temperature, weighted by density, by
     passing 'temp' as the qty and 'rho' as the weight.
+
+    .. versionchanged :: 2.5.0
+
+      The parameter *distance* has been added. If provided, the quantity is sampled on a thin spherical shell at
+      this radius (in position units).
 
     Parameters
     ----------
@@ -119,6 +135,10 @@ def render_spherical_image(snap, quantity='rho', nside=None, kernel=None, denois
 
     nside : int
         The healpix nside resolution to use (must be power of 2)
+
+    distance : float, str, units.UnitBase, optional
+        If provided, render a thin spherical shell at this radius (in position units) using the full 3D kernel,
+        instead of the default line-of-sight projection. The result then carries volumetric units.
 
     kernel : str, kernels.KernelBase, optional
         The Kernel object to use (defaults to 3D spline kernel)
@@ -146,7 +166,7 @@ def render_spherical_image(snap, quantity='rho', nside=None, kernel=None, denois
         quantity = qty
 
     renderer = renderers.make_render_pipeline(snap, quantity, nside=nside, target='healpix', kernel=kernel,
-                                              out_units=out_units, threaded=threaded,
+                                              shell_distance=distance, out_units=out_units, threaded=threaded,
                                               approximate_fast=False, weight=weight)
 
     return renderer.render()

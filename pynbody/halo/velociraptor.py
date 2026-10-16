@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import os
 import warnings
 from pathlib import Path
 from typing import Optional
@@ -43,11 +44,13 @@ class VelociraptorCatalogue(HaloCatalogue):
 
         for basepath in possible_paths:
             if basepath.is_dir():
-                for p in basepath.iterdir():
-                    if snapshot_num and p.is_dir() and f'{snapshot_num:04d}' in p.name:
-                        possible_paths.append(p)
-                    if 'catalog_groups.0' in p.name and p.is_file():
-                        return basepath / str(p.name)[:-(len('.catalog_groups.0'))]
+                # os.scandir entries can usually report is_dir/is_file without a further stat per entry
+                with os.scandir(basepath) as entries:
+                    for p in entries:
+                        if snapshot_num and p.is_dir() and f'{snapshot_num:04d}' in p.name:
+                            possible_paths.append(Path(p.path))
+                        if 'catalog_groups.0' in p.name and p.is_file():
+                            return basepath / p.name[:-(len('.catalog_groups.0'))]
         return None
 
     @classmethod
@@ -154,7 +157,7 @@ class VelociraptorCatalogue(HaloCatalogue):
                                                     np.array([self._num_halos],
                                                              dtype=self._children_start_index.dtype)))
 
-    def get_properties_one_halo(self, halo_number) -> dict:
+    def _get_properties_one_halo(self, halo_number) -> dict:
         i_zerobased = self.number_mapper.number_to_index(halo_number)
         properties = {k: self._props[k][i_zerobased] * u
                       for k, u in zip(self._property_keys, self._property_units)}
@@ -180,13 +183,13 @@ class VelociraptorCatalogue(HaloCatalogue):
 
     def _get_particle_indices_one_halo(self, halo_number) -> NDArray[int]:
         i_zerobased = self.number_mapper.number_to_index(halo_number)
-        ptcl_fpos = self.__get_particle_indices_from_halo_index(i_zerobased, False)
+        ptcl_ids = self.__get_particle_ids_from_halo_index(i_zerobased, False)
 
         if self._include_unbound:
-            ptcl_fpos_unbound =  self.__get_particle_indices_from_halo_index(i_zerobased, True)
-            ptcl_fpos = np.concatenate((ptcl_fpos, ptcl_fpos_unbound))
+            ptcl_ids_unbound = self.__get_particle_ids_from_halo_index(i_zerobased, True)
+            ptcl_ids = np.concatenate((ptcl_ids, ptcl_ids_unbound))
 
-        return np.sort(ptcl_fpos)
+        return np.sort(self._map_iords_to_fpos_one_halo(ptcl_ids, halo_number))
 
     def _get_all_particle_indices(self) -> HaloParticleIndices | tuple[np.ndarray, np.ndarray]:
         particle_ids_hdf_array = self._part_ids['Particle_IDs']
@@ -200,26 +203,22 @@ class VelociraptorCatalogue(HaloCatalogue):
                                               [self._part_ids_unbound['Particle_IDs'].shape[0]]),
                                              dtype=np.intp)
             boundaries_unbound = np.vstack((offsets_unbound[:-1], offsets_unbound[1:])).T
-            output_boundaries = boundaries + boundaries_unbound
-            particle_ids = np.empty(num_ids, dtype=np.intp)
-
-            for (a,b), (a_unbound, b_unbound), (a_out, b_out) in zip(boundaries, boundaries_unbound, output_boundaries):
-                particle_ids[a_out:b_out] = np.sort(self._iord_to_fpos.map_ignoring_order(
-                    np.concatenate((self._part_ids['Particle_IDs'][a:b],
-                                    self._part_ids_unbound['Particle_IDs'][a_unbound:b_unbound])))
-                )
+            mapped_iords_per_halo = (
+                self._map_iords_to_fpos(np.concatenate((self._part_ids['Particle_IDs'][a:b],
+                                                        self._part_ids_unbound['Particle_IDs'][a_unbound:b_unbound])))
+                for (a, b), (a_unbound, b_unbound) in zip(boundaries, boundaries_unbound)
+            )
         else:
-            output_boundaries = boundaries
+            num_ids = particle_ids_hdf_array.shape[0]
 
-            particle_ids = np.empty(particle_ids_hdf_array.shape[0], dtype=np.intp)
+            mapped_iords_per_halo = (self._map_iords_to_fpos(self._part_ids['Particle_IDs'][a:b])
+                                     for a, b in boundaries)
 
-            for a,b in boundaries:
-                particle_ids[a:b] = np.sort(self._iord_to_fpos.map_ignoring_order(self._part_ids['Particle_IDs'][a:b]))
-
-        return particle_ids, output_boundaries
+        return self._assemble_particle_indices(mapped_iords_per_halo, num_halos=len(boundaries),
+                                               num_particles=num_ids, sort=True)
 
 
-    def __get_particle_indices_from_halo_index(self, i_zerobased, unbound):
+    def __get_particle_ids_from_halo_index(self, i_zerobased, unbound):
         if unbound:
             grps_hdf_array = self._grps['Offset_unbound']
             particle_ids_hdf_array = self._part_ids_unbound['Particle_IDs']
@@ -234,6 +233,4 @@ class VelociraptorCatalogue(HaloCatalogue):
         else:
             ptcl_end = grps_hdf_array[i_zerobased + 1]
 
-        ptcl_ids_this_halo = particle_ids_hdf_array[ptcl_start:ptcl_end]
-        ptcl_fpos = self._iord_to_fpos.map_ignoring_order(ptcl_ids_this_halo)
-        return ptcl_fpos
+        return particle_ids_hdf_array[ptcl_start:ptcl_end]

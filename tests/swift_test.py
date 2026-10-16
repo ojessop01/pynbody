@@ -1,16 +1,22 @@
+import os
 import shutil
+from contextlib import contextmanager
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import h5py
 import numpy as np
 import numpy.testing as npt
 import pytest
-from pytest import raises
+from pytest import raises, warns
 
 import pynbody
 import pynbody.halo.velociraptor
 import pynbody.snapshot.swift
 import pynbody.test_utils
+from pynbody.snapshot import gadgethdf
+from pynbody.test_utils.split_swift_snapshot import ensure_split_snapshot_exists
+from pynbody.util import hdf_bulk_read
 
 
 @pytest.fixture(scope='module', autouse=True)
@@ -19,12 +25,12 @@ def get_data():
     pynbody.test_utils.ensure_test_data_available("swift_isolated")
     pynbody.test_utils.ensure_test_data_available("swift_planetary")
 
-def test_load_identifies_swift():
-    f = pynbody.load("testdata/SWIFT/snap_0150.hdf5")
+def test_load_identifies_swift(load_kwargs):
+    f = pynbody.load("testdata/SWIFT/snap_0150.hdf5", **load_kwargs)
     assert isinstance(f, pynbody.snapshot.swift.SwiftSnap)
 
-def test_swift_properties():
-    f = pynbody.load("testdata/SWIFT/snap_0150.hdf5")
+def test_swift_properties(load_kwargs):
+    f = pynbody.load("testdata/SWIFT/snap_0150.hdf5", **load_kwargs)
 
     assert np.allclose(f.properties['a'], 0.38234515)
     assert np.allclose(f.properties['z'], 1.61543791)
@@ -34,15 +40,19 @@ def test_swift_properties():
     assert np.allclose(f.properties['omegaL0'], 0.724)
     assert np.allclose(f.properties['omegaNu0'], 0.0)
 
-def test_swift_noncosmological():
-    f = pynbody.load("testdata/SWIFT/isolated_0008.hdf5")
+    # NB this incorrectly gave a 'comoving' time (i.e. in units of s a) due to inferring from joint vel/pos
+    # units, which is inconsistent with what swift actually outputs.
+    assert np.allclose(f.properties['time'].in_units("s"), 1.28661456e17)
+
+def test_swift_noncosmological(load_kwargs):
+    f = pynbody.load("testdata/SWIFT/isolated_0008.hdf5", **load_kwargs)
     assert isinstance(f, pynbody.snapshot.swift.SwiftSnap)
     assert (f['pos'].units / pynbody.units.Unit("cm")).is_dimensionless()
 
 
 
-def test_swift_arrays():
-    f = pynbody.load("testdata/SWIFT/snap_0150.hdf5")
+def test_swift_arrays(load_kwargs):
+    f = pynbody.load("testdata/SWIFT/snap_0150.hdf5", **load_kwargs)
     assert np.allclose(f.dm['pos'].units.ratio("Mpc a", **f.conversion_context()), 1.0)
     assert np.allclose(f.dm['vel'].units.ratio("km s^-1", **f.conversion_context()), 1.0)
     # the reason the following isn't exactly 1.0 is because our solar mass is slightly different to swift's
@@ -73,28 +83,28 @@ def _assert_multifile_contents_is_sensible(f):
                                                        [83.46050257, 20.91647755, 116.546989],
                                                        [125.83232028, 49.9732396, 72.2264199]]))
 
-def test_swift_multifile_with_vds():
-    f = pynbody.load("testdata/SWIFT/multifile_with_vds/snap_0000.hdf5")
+def test_swift_multifile_with_vds(load_kwargs):
+    f = pynbody.load("testdata/SWIFT/multifile_with_vds/snap_0000.hdf5", **load_kwargs)
     assert isinstance(f, pynbody.snapshot.swift.SwiftSnap)
     assert len(f._hdf_files) == 1
     assert f._hdf_files.is_virtual()
     _assert_multifile_contents_is_sensible(f)
 
 
-def test_swift_multifile_without_vds():
-    f = pynbody.load("testdata/SWIFT/multifile_without_vds/snap_0000")
+def test_swift_multifile_without_vds(load_kwargs):
+    f = pynbody.load("testdata/SWIFT/multifile_without_vds/snap_0000", **load_kwargs)
     assert isinstance(f, pynbody.snapshot.swift.SwiftSnap)
     assert len(f._hdf_files) == 10
     assert not f._hdf_files.is_virtual()
     _assert_multifile_contents_is_sensible(f)
 
-def test_swift_singlefile_is_not_vds():
-    f = pynbody.load("testdata/SWIFT/snap_0150.hdf5")
+def test_swift_singlefile_is_not_vds(load_kwargs):
+    f = pynbody.load("testdata/SWIFT/snap_0150.hdf5", **load_kwargs)
     assert not f._hdf_files.is_virtual()
 
-def test_swift_singlefile_partial_loading():
+def test_swift_singlefile_partial_loading(load_kwargs):
     f = pynbody.load("testdata/SWIFT/snap_0150.hdf5",
-                     take_swift_cells=[5,15,20,25])
+                     take_swift_cells=[5,15,20,25], **load_kwargs)
     assert len(f.dm) == 1849
     assert len(f.gas) == 1882
     assert (f.dm['iord'][::100] == [ 16468,   9172,  41176,  49874,   9342,  10234,  33908,  25852,
@@ -104,9 +114,9 @@ def test_swift_singlefile_partial_loading():
                                      26367,  2503, 26825, 10827, 59463, 26703, 51909, 27927, 12057,
                                      36761]).all()
 
-def test_swift_multifile_partial_loading():
+def test_swift_multifile_partial_loading(load_kwargs):
     f = pynbody.load("testdata/SWIFT/multifile_without_vds/snap_0000",
-                     take_swift_cells=[0,5,20,200])
+                     take_swift_cells=[0,5,20,200], **load_kwargs)
 
     assert len(f) == 2048
 
@@ -133,22 +143,72 @@ def test_swift_multifile_partial_loading():
                           [ 16.59894837,  36.67247821,  85.82433427],
                           [  9.79404938,  52.28051827,  81.30710868]])
 
-def test_swift_multifile_partial_loading_order_insensitive():
+def test_swift_multifile_partial_loading_order_insensitive(load_kwargs):
     f = pynbody.load("testdata/SWIFT/multifile_without_vds/snap_0000",
-                     take_swift_cells=[0, 5, 20, 200])
+                     take_swift_cells=[0, 5, 20, 200], **load_kwargs)
     f2 = pynbody.load("testdata/SWIFT/multifile_without_vds/snap_0000",
-                     take_swift_cells=[0, 5, 20, 200][::-1])
+                     take_swift_cells=[0, 5, 20, 200][::-1], **load_kwargs)
     assert (f['iord'] == f2['iord']).all()
 
-def test_swift_vds_partial_loading():
+def test_swift_vds_partial_loading(load_kwargs):
     f = pynbody.load("testdata/SWIFT/multifile_with_vds/snap_0000.hdf5", # <-- VDS file
-                     take_swift_cells=[0,5,20,200])
+                     take_swift_cells=[0,5,20,200], **load_kwargs)
     f2 = pynbody.load("testdata/SWIFT/multifile_without_vds/snap_0000",
-                      take_swift_cells=[0, 5, 20, 200][::-1])
+                      take_swift_cells=[0, 5, 20, 200][::-1], **load_kwargs)
     assert (f['iord'] == f2['iord']).all()
 
-def test_swift_fof_groups():
-    f = pynbody.load("testdata/SWIFT/snap_0150.hdf5")
+@pytest.fixture
+def bulk_readers_opened(monkeypatch):
+    """Record the reader chosen for every dataset pynbody reads in bulk"""
+    opened = []
+    original_open = hdf_bulk_read.BulkReader.open
+
+    def recording_open(self, dataset):
+        reader = original_open(self, dataset)
+        opened.append(reader)
+        return reader
+
+    monkeypatch.setattr(hdf_bulk_read.BulkReader, "open", recording_open)
+    return opened
+
+
+@pytest.mark.parametrize("take_swift_cells", [None, [0, 5, 20, 200]])
+def test_swift_vds_is_read_from_its_sources(bulk_readers_opened, take_swift_cells):
+    """The virtual datasets of a SWIFT single-file view are decomposed and read directly from their source files,
+    rather than being read through libhdf5"""
+    f = pynbody.load("testdata/SWIFT/multifile_with_vds/snap_0000.hdf5", take_swift_cells=take_swift_cells)
+    f2 = pynbody.load("testdata/SWIFT/multifile_without_vds/snap_0000", take_swift_cells=take_swift_cells)
+    for array_name in f.loadable_keys():
+        npt.assert_array_equal(f[array_name], f2[array_name])
+    virtual_readers = [r for r in bulk_readers_opened if isinstance(r, hdf_bulk_read.virtual._VirtualReader)]
+    assert len(virtual_readers) == len(f.loadable_keys())
+
+
+@pytest.mark.parametrize("filename, open_kwargs",
+                         [("testdata/SWIFT/snap_0150.hdf5", {}),
+                          ("testdata/SWIFT/snap_0150.hdf5", {'take_region': pynbody.filt.Sphere(20., (50., 50., 50.))}),
+                          ("testdata/SWIFT/multifile_with_vds/snap_0000.hdf5", {}),
+                          ("testdata/SWIFT/planetary.hdf5", {})])
+def test_swift_bulk_read_backends_agree(monkeypatch, bulk_readers_opened, filename, open_kwargs):
+    arrays = {}
+    for backend in ['h5py', 'direct']:
+        monkeypatch.setattr(gadgethdf, "_direct_bulk_read", backend == 'direct')
+        bulk_readers_opened.clear()
+        f = pynbody.load(filename, **open_kwargs)
+        arrays[backend] = {k: np.asarray(f[k]) for k in f.loadable_keys()}
+        if backend == 'direct':
+            assert not any(isinstance(r, h5py.Dataset) for r in bulk_readers_opened)
+        else:
+            assert all(isinstance(r, h5py.Dataset) for r in bulk_readers_opened)
+
+    assert arrays['h5py'].keys() == arrays['direct'].keys()
+    for k in arrays['h5py']:
+        assert arrays['h5py'][k].dtype == arrays['direct'][k].dtype
+        npt.assert_array_equal(arrays['h5py'][k], arrays['direct'][k])
+
+
+def test_swift_fof_groups(load_kwargs):
+    f = pynbody.load("testdata/SWIFT/snap_0150.hdf5", **load_kwargs)
     h = f.halos(priority = ['HaloNumberCatalogue'])
 
     with raises(KeyError):
@@ -160,26 +220,26 @@ def test_swift_fof_groups():
 
     assert len(h) < 1000
 
-def test_swift_dtypes():
-    f = pynbody.load("testdata/SWIFT/snap_0150.hdf5")
+def test_swift_dtypes(load_kwargs):
+    f = pynbody.load("testdata/SWIFT/snap_0150.hdf5", **load_kwargs)
     assert np.issubdtype(f['iord'].dtype, np.integer)
     assert np.issubdtype(f['pos'].dtype, np.floating)
 
 @pytest.mark.parametrize('test_region',
                          [pynbody.filt.Sphere(50., (50., 50., 50.)),
                          pynbody.filt.Cuboid(-20.0)]) # note the cuboid test region wraps around the box
-def test_swift_take_geometric_region(test_region):
+def test_swift_take_geometric_region(test_region, load_kwargs):
     f = pynbody.load("testdata/SWIFT/snap_0150.hdf5",
-                     take_region = test_region)
+                     take_region = test_region, **load_kwargs)
 
-    f_full = pynbody.load("testdata/SWIFT/snap_0150.hdf5")
+    f_full = pynbody.load("testdata/SWIFT/snap_0150.hdf5", **load_kwargs)
 
     assert len(f) < len(f_full)
 
     assert np.all(f[test_region]['iord'] == f_full[test_region]['iord'])
 
-def test_swift_scalefactor_in_units():
-    f = pynbody.load("testdata/SWIFT/snap_0150.hdf5")
+def test_swift_scalefactor_in_units(load_kwargs):
+    f = pynbody.load("testdata/SWIFT/snap_0150.hdf5", **load_kwargs)
 
     # naively, one would assume cm^2 s^-2, but actual units header says 1e10 a^2 cm^2 s^-2
     # So this tests pynbody respects that. Note that we don't give the scalefactor context,
@@ -239,14 +299,14 @@ def swift_snap_with_alternate_mass_naming():
     # clean up
     shutil.rmtree(tempdir)
 
-def test_alternate_mass_file(swift_snap_with_alternate_mass_naming):
+def test_alternate_mass_file(swift_snap_with_alternate_mass_naming, load_kwargs):
     f = pynbody.load(swift_snap_with_alternate_mass_naming)
-    f1 = pynbody.load("testdata/SWIFT/snap_0150.hdf5")
+    f1 = pynbody.load("testdata/SWIFT/snap_0150.hdf5", **load_kwargs)
 
     assert np.allclose(f['mass'], f1['mass'])
 
-def test_load_planetary():
-    f = pynbody.load("testdata/SWIFT/planetary.hdf5")
+def test_load_planetary(load_kwargs):
+    f = pynbody.load("testdata/SWIFT/planetary.hdf5", **load_kwargs)
     assert isinstance(f, pynbody.snapshot.swift.SwiftSnap)
     assert len(f) == 1000
     assert len(f.gas) == 1000
@@ -262,10 +322,15 @@ def test_load_planetary():
           [35.47905534, 55.80711974, 68.81765962],
           [35.50355171, 60.95662443, 54.52549088]])
 
+def test_load_planetary_region():
+    # The planetary example is an incomplete snapshot with all cell counts
+    # equal to zero, so this should fail
+    with raises(ValueError) as excinfo:
+        f = pynbody.load("testdata/SWIFT/planetary.hdf5", take_region=pynbody.filt.Sphere(10., (60., 60., 60.)))
+    assert "No spatial index" in str(excinfo.value)
 
-
-def test_planetary_physical_units():
-    f = pynbody.load("testdata/SWIFT/planetary.hdf5")
+def test_planetary_physical_units(load_kwargs):
+    f = pynbody.load("testdata/SWIFT/planetary.hdf5", **load_kwargs)
     f.physical_units('1e3 km')
     npt.assert_allclose(f['pos'][::100], [[ 64.96079021, 468.85991433, 313.24147579],
           [159.25107139, 424.78484083, 381.50705574],
@@ -277,3 +342,287 @@ def test_planetary_physical_units():
           [222.85219794, 391.8567664 , 395.02856333],
           [226.0370616 , 355.54715989, 438.43730943],
           [226.19312796, 388.35465427, 347.38190241]])
+
+
+@pytest.fixture
+def multifile_with_multiple_types():
+    """
+    Split a snapshot with gas and dark matter over multiple files
+    """
+    nr_files = 8
+    input_snapshot = "./testdata/SWIFT/snap_0150.hdf5"
+    output_dir = "./testdata/SWIFT/multi_file_multi_type"
+    output_name = "split_snap_0150.0.hdf5"
+    rng = np.random.default_rng(0)
+    cell_file_index = rng.integers(nr_files, size=512)
+    return ensure_split_snapshot_exists(input_snapshot, nr_files, output_dir, output_name,
+                                        cell_file_index)
+
+@pytest.mark.parametrize('test_region',
+                         [pynbody.filt.Sphere(50., (50., 50., 50.)),
+                         pynbody.filt.Cuboid(-20.0)]) # note the cuboid test region wraps around the box
+def test_swift_take_region_multiple_files_and_types(test_region, multifile_with_multiple_types):
+    f = pynbody.load(multifile_with_multiple_types, take_region = test_region)
+    f_full = pynbody.load(multifile_with_multiple_types)
+    assert len(f_full) == 524288
+    assert len(f) < len(f_full)
+    assert np.all(f[test_region]['iord'] == f_full[test_region]['iord'])
+    assert len(f.families())==2
+    assert len(f_full.families())==2
+
+
+@pytest.fixture(params=[
+    (1, True),  # all datasets have non-zero size when nr_files==1
+    (8, True),  # multi file with all datasets present
+    (8, False), # multi file with zero sized datasets omitted
+])
+def snapshot_with_sparse_gas(request, tmp_path):
+    # Create a snapshot where only one cell has gas particles
+    nr_files, write_zero_size_datasets = request.param
+    input_snapshot = "./testdata/SWIFT/snap_0150.hdf5"
+    output_dir = f"./testdata/SWIFT/sparse_gas/nfiles_{nr_files}{'_zero_size' if write_zero_size_datasets else ''}"
+    output_name = "split_snap_0150.0.hdf5"
+    rng = np.random.default_rng(0)
+    cell_file_index = rng.integers(nr_files, size=512)
+    gas_mask = np.zeros(512, dtype=bool)
+    gas_mask[337] = True # Only keep the gas in this cell
+    return ensure_split_snapshot_exists(input_snapshot, nr_files, output_dir,
+                                        output_name, cell_file_index,
+                                        write_zero_size_datasets=write_zero_size_datasets,
+                                        cell_mask={"PartType0" : gas_mask})
+
+
+def test_swift_open_snapshot_with_sparse_gas(snapshot_with_sparse_gas):
+    # Make sure we can open a snapshot where some files have datasets
+    # which would contain zero particles and therefore might not have
+    # been written at all.
+    f = pynbody.load(snapshot_with_sparse_gas)
+    assert len(f.families()) == 2
+    assert "gas" in f.families()
+    assert "dm" in f.families()
+    for name in ("pos", "vel", "mass", "iord", "grp"):
+        assert name in f.dm.loadable_keys()
+        assert name in f.gas.loadable_keys()
+
+
+@pytest.mark.parametrize('test_params', [
+    (pynbody.filt.Sphere(10., (97.795, 44.452, 26.671)), True),  # contains gas
+    (pynbody.filt.Sphere(10., (30.000, 44.452, 26.671)), False), # contains no gas
+])
+def test_swift_open_region_with_sparse_gas(snapshot_with_sparse_gas, test_params):
+    test_region, expect_gas = test_params
+    f = pynbody.load(snapshot_with_sparse_gas, take_region=test_region)
+
+    # The families() method only reports families with >0 particles
+    assert len(f.families()) == (2 if expect_gas else 1)
+
+    # But we should still always have gas and dm families with arrays
+    for name in ("pos", "vel", "mass", "iord", "grp"):
+        assert name in f.dm.loadable_keys()
+        assert name in f.gas.loadable_keys()
+
+    # We should be able to read the gas coordinates, and get an empty array
+    # if the selection does not cover the region with gas.
+    gas_pos = f.gas["pos"]
+    assert gas_pos.shape == ((274,3) if expect_gas else (0,3)) # cell 337 has 274 gas particles
+
+    # Check that the gas coordinates we got are correct
+    if expect_gas:
+        f_full = pynbody.load("./testdata/SWIFT/snap_0150.hdf5", take_swift_cells=(337,))
+        assert np.all(gas_pos == f_full.gas["pos"])
+
+
+@pytest.fixture(params=[
+    (1, True),  # single file with empty gas datasets
+    (8, True),  # multi file with empty gas datasets
+])
+def snapshot_with_no_gas(request, tmp_path):
+    # Create a snapshot where the gas particle datasets exist
+    # but there are zero gas particles. This is to simulate how
+    # recent Swift versions always write out the same set of
+    # datasets in all snapshots, even if stars or black holes
+    # have not formed yet.
+    nr_files, write_zero_size_datasets = request.param
+    input_snapshot = "./testdata/SWIFT/snap_0150.hdf5"
+    output_dir = f"./testdata/SWIFT/no_gas/nfiles_{nr_files}{'_zero_size' if write_zero_size_datasets else ''}"
+    output_name = "split_snap_0150.0.hdf5"
+    rng = np.random.default_rng(0)
+    cell_file_index = rng.integers(nr_files, size=512)
+    gas_mask = np.zeros(512, dtype=bool) # discard all gas
+    return ensure_split_snapshot_exists(input_snapshot, nr_files, output_dir,
+                                        output_name, cell_file_index,
+                                        write_zero_size_datasets=write_zero_size_datasets,
+                                        cell_mask={"PartType0" : gas_mask})
+
+
+def test_swift_open_snapshot_with_no_gas(snapshot_with_no_gas):
+    f = pynbody.load(snapshot_with_no_gas)
+
+    # The families() method only reports families with >0 particles
+    assert len(f.families()) == 1
+    assert "dm" in f.families()
+
+    # But we should still always have gas and dm families with arrays
+    for name in ("pos", "vel", "mass", "iord", "grp"):
+        assert name in f.dm.loadable_keys()
+        assert name in f.gas.loadable_keys()
+
+    # We should be able to read the gas coordinates, and get an empty array
+    gas_pos = f.gas["pos"]
+    assert gas_pos.shape == (0,3)
+
+    # Check we can read the DM particles correctly.
+    # Ordering of the cells will differ in the multi file case.
+    f_full = pynbody.load("./testdata/SWIFT/snap_0150.hdf5")
+    def sorted_dm_coords(snap):
+        order = np.argsort(snap.dm["iord"])
+        return snap.dm["pos"][order,:]
+    assert np.all(sorted_dm_coords(f) == sorted_dm_coords(f_full))
+
+
+@pytest.fixture(scope="function")
+def copied_snapshot():
+    with TemporaryDirectory(dir="testdata/SWIFT", prefix=".snap_0150_copy.") as tmp:
+        tmp_snap = Path(tmp) / "snap_0150.hdf5"
+        shutil.copy("./testdata/SWIFT/snap_0150.hdf5", tmp_snap)
+        yield tmp_snap
+        # Try to ensure the snapshot is closed so we can delete the file
+        # (Windows locks files that are open)
+        import gc
+        gc.collect()
+
+
+@pytest.mark.parametrize('metadata_change', [
+    # Dataset,                         index,   new value
+    ("Cells/Counts/PartType0",         395,     811),    # wrong total number of particles (cell 395 has 810 particles)
+    ("Cells/Files/PartType0",          5,      -1),      # negative file index for cell 5
+    ("Cells/Files/PartType0",          5,       1),      # file index too large for cell 5 (it's a single file snapshot)
+    ("Cells/OffsetsInFile/PartType1",  503,     261672), # offset+count too large (cell 503 has 473 particles, there are 262144 total)
+    ("Cells/OffsetsInFile/PartType1",  1,      -1),      # negative offset for cell 1
+])
+def test_swift_wrong_cell_metadata(copied_snapshot, metadata_change):
+    """Check that we reject snapshots where cell metadata fails consistency checks"""
+    dset, index, value = metadata_change
+
+    # Modify the cell metadata
+    with h5py.File(copied_snapshot, "r+") as f:
+        f[dset][index] = value
+
+    # Reading a region fails because the cell metadata is incorrect
+    with raises(ValueError):
+        snap = pynbody.load(copied_snapshot, take_region=pynbody.filt.Sphere(50., (50., 50., 50.)))
+
+    # Reading the full snapshot does not require the cell metadata, so it still works
+    snap = pynbody.load(copied_snapshot)
+    assert isinstance(snap, pynbody.snapshot.swift.SwiftSnap)
+
+
+@contextmanager
+def tmp_directory_copy(src_dir):
+    """Make a temporary copy of a directory containing snapshot files"""
+    src_dir = Path(src_dir)
+    with TemporaryDirectory(dir=src_dir.parent, prefix=f".{src_dir.name}.") as tmp_dir:
+        dest_dir = Path(tmp_dir) / src_dir.name
+        shutil.copytree(src_dir, dest_dir)
+        yield dest_dir
+
+
+@pytest.fixture
+def writable_sparse_gas(snapshot_with_sparse_gas):
+    with tmp_directory_copy(Path(snapshot_with_sparse_gas).parent) as tmp:
+        try:
+            yield tmp / Path(snapshot_with_sparse_gas).name
+        finally:
+            # Ensure HDF5 files are closed
+            import gc
+            gc.collect()
+
+
+def test_swift_add_field(writable_sparse_gas):
+    """
+    Check that the snapshot is still readable if we write a new field
+
+    Use the sparse gas fixture so we test single and multi file snapshots
+    and cases with and without zero sized datasets present.
+    """
+    # Open the snapshot and write a new array
+    snap = pynbody.load(writable_sparse_gas)
+    test_array = np.random.uniform(0, 1, len(snap))
+    snap['test_array'] = test_array
+    snap['test_array'].write()
+
+    # Check it can still be loaded back in
+    snap = pynbody.load(writable_sparse_gas)
+    assert np.all(snap['test_array'] == test_array)
+
+    # Should have a new array for all groups with a ParticleIDs dataset, even
+    # if the group contains no particles.
+    for f in snap._hdf_files:
+        for group_name, group in f.items():
+            if group_name.startswith("PartType"):
+                assert "test_array" in group
+                assert group["ParticleIDs"].shape == group["test_array"].shape
+
+
+def test_swift_add_field_for_family(writable_sparse_gas):
+    """
+    Test writing a new field for one family only.
+
+    Use the sparse gas fixture so we test single and multi file snapshots
+    and cases with and without zero sized datasets present.
+    """
+    # Open the snapshot and write a new array
+    snap = pynbody.load(writable_sparse_gas)
+    test_array = np.random.uniform(0, 1, len(snap.gas))
+    snap.gas['test_array'] = test_array
+    snap.gas['test_array'].write()
+
+    # Check it can still be loaded back in
+    snap = pynbody.load(writable_sparse_gas)
+    assert np.all(snap.gas['test_array'] == test_array)
+
+    # Should have a new array for all gas groups, even if there are zero
+    # gas particles
+    for f in snap._hdf_files:
+        for group_name, group in f.items():
+            if group_name == "PartType0":
+                assert "test_array" in group
+                assert group["ParticleIDs"].shape == group["test_array"].shape
+            elif group_name.startswith("PartType"):
+                assert "test_array" not in group
+
+
+def test_swift_write_array_to_region(copied_snapshot):
+
+    # Open a region in the snapshot and create a new array
+    snap = pynbody.load(copied_snapshot, take_region=pynbody.filt.Sphere(50., (50., 50., 50.)))
+    snap['test_array'] = np.random.uniform(0, 1, len(snap))
+
+    # Writing the new array should not work
+    with pytest.raises(NotImplementedError):
+        snap['test_array'].write()
+
+
+def test_files_opened_by_absolute_path(monkeypatch):
+    """So that HDF5 and pynbody's direct reader agree on where the sources of virtual datasets are, even if the
+    current directory changes after loading"""
+    f = pynbody.load("testdata/SWIFT/multifile_with_vds/snap_0000.hdf5")
+    assert os.path.isabs(f._hdf_files[0].file.filename)
+    monkeypatch.chdir("testdata")
+    npt.assert_array_equal(f['iord'], pynbody.load("SWIFT/multifile_without_vds/snap_0000")['iord'])
+
+
+@pytest.mark.parametrize("filename", ["testdata/SWIFT/snap_0150.hdf5", "testdata/SWIFT/multifile_without_vds/snap_0000"])
+def test_swift_take(filename, load_kwargs):
+    """An explicit take= selects particles from a SWIFT snapshot, as it does for other formats"""
+    f = pynbody.load(filename, **load_kwargs)
+    take = np.arange(3, len(f), 7)
+    f_take = pynbody.load(filename, take=take, **load_kwargs)
+    assert len(f_take) == len(take)
+    npt.assert_array_equal(f_take['iord'], f['iord'][take])
+    npt.assert_array_equal(f_take['pos'], f['pos'][take])
+
+
+def test_swift_take_cannot_be_combined_with_cells():
+    with pytest.raises(ValueError, match="take cannot be combined"):
+        pynbody.load("testdata/SWIFT/multifile_without_vds/snap_0000", take=np.arange(10), take_swift_cells=[0, 1])

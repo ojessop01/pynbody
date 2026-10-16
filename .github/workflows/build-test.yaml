@@ -9,20 +9,25 @@ defaults:
 jobs:
   fetch-testdata:
     uses: ./.github/workflows/fetch-testdata.yaml
+  fetch-tables:
+    uses: ./.github/workflows/fetch-tables.yaml
 
   build:
-    needs: fetch-testdata
+    needs: [fetch-testdata, fetch-tables]
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-2025]
-        python-version: ["3.11", "3.12", "3.13", "3.14"]
-        numpy-version: ["2.0.2", "2.3.3"]
+        python-version: ["3.12", "3.13", "3.14"]
+        numpy-version: ["2.2.0", "2.5.0"]
+        include:
+          - os: ubuntu-latest
+            test_flags: "--hdfstream-server=http://localhost:8080/hdfstream"
+          - os: windows-2025
+            test_flags: ""
         exclude:
           - python-version: "3.14"
-            numpy-version: "2.0.2"
-          - python-version: "3.13"
-            numpy-version: "2.0.2"
+            numpy-version: "2.2.0"
 
     runs-on: ${{ matrix.os }}
     env:
@@ -45,19 +50,43 @@ jobs:
       run: |
         python -m pip install --upgrade pip setuptools wheel
         python -m pip install numpy==${{ matrix.numpy-version }}
+        python -m pip install hdfstream
     - name: Build and install pynbody
       run: |
         python -m pip install -v .[tests]
 
     - name: Restore testdata cache
-      uses: actions/cache/restore@v4
+      uses: actions/cache/restore@v5
       with:
         path: tests/testdata
         key: testdata-${{ needs.fetch-testdata.outputs.testdata-key }}
         enableCrossOsArchive: true
-    - name: Run all tests
+
+    - name: Restore table data cache
+      id: cache-tables
+      uses: actions/cache/restore@v5
+      with:
+        path: ionfrac_tables
+        key: ionfrac-${{ needs.fetch-tables.outputs.ionfrac-key }}
+        enableCrossOsArchive: true
+
+    - name: Copy table data to pynbody installation
+      working-directory: ionfrac_tables
+      run: |
+        DESTDIR=$(python -c "import pynbody ; import os ; print(os.path.dirname(pynbody.analysis.__file__))")
+        cp *.npz "${DESTDIR}"
+
+    - name: Start hdfstream container to serve test data
+      uses: ./.github/actions/start-hdfstream
+      if: ${{ (matrix.os == 'ubuntu-latest') }}
+      with:
+        data-dir: ./tests/testdata
+        virtual-prefix: testdata
+        image: ghcr.io/jchelly/hdfstream-api:0.0.10
+
+    - name: Run tests
       working-directory: tests
-      run: python -m pytest --ignore=testdata/ --tb=short
+      run: python -m pytest --ignore=testdata/ --tb=short ${{ matrix.test_flags }}
     # Following is temporarily necessary because of the >2.0.0rc1 numpy version
     - name: sanitize artifact name
       if: always()
@@ -65,8 +94,12 @@ jobs:
         TARGET_SANI=$(echo "images-${{ matrix.python-version }}-${{ matrix.numpy-version }}-${{ matrix.os }}" | tr ">" "_")
         echo "TARGET_SANI=${TARGET_SANI}" >> "$GITHUB_ENV"
     - name: Upload test images
-      uses: actions/upload-artifact@v5
+      uses: actions/upload-artifact@v6
       if: success() || failure()
       with:
         name: ${{ env.TARGET_SANI }}
         path: tests/result*.npy
+
+    - name: Stop hdfstream container
+      uses: ./.github/actions/stop-hdfstream
+      if: ${{ (matrix.os == 'ubuntu-latest') }}

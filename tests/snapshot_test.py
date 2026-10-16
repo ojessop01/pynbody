@@ -7,12 +7,22 @@ import pytest
 
 import pynbody
 import pynbody.test_utils
+from pynbody import units
 
 
 @pytest.fixture(scope='module', autouse=True)
 def get_data():
     pynbody.test_utils.ensure_test_data_available("gasoline_ahf")
 
+@pytest.fixture(scope="function")
+def sim_with_units():
+    sim = pynbody.new(dm=10, star=5)
+    sim._file_units_system = [units.kpc, units.km / units.s, units.Msol, units.K]
+    sim["pos"][:] = 1.0
+    sim["vel"][:] = 1.0
+    sim["mass"][:] = 1.0
+    sim.set_units_system()
+    return sim
 
 def setup_module():
     global f, h
@@ -309,3 +319,117 @@ def test_race_condition():
         t.start()
     for t in threads:
         t.join()
+
+
+def test_set_units_system(sim_with_units):
+    sim_with_units.set_units_system(distance="Mpc", velocity="m s^-1", mass="10 Msol")
+    assert sim_with_units['pos'].units == 'Mpc'
+    np.testing.assert_allclose(sim_with_units['pos'], 1.0)    
+    assert sim_with_units['vel'].units == 'm s^-1'
+    np.testing.assert_allclose(sim_with_units['vel'], 1.0)
+    assert sim_with_units['mass'].units == '10 Msol'
+    np.testing.assert_allclose(sim_with_units['mass'], 1.0)
+
+def test_set_units_system_after_units_change(sim_with_units):
+
+    sim_with_units.physical_units(distance="pc")
+    np.testing.assert_allclose(sim_with_units['pos'], 1e3)
+
+    sim_with_units.set_units_system(distance="Mpc")
+    assert sim_with_units['pos'].units == 'Mpc'
+    np.testing.assert_allclose(sim_with_units['pos'], 1.0)
+
+def test_set_units_system_updates_sim_properties(sim_with_units):
+
+    # test unitbase in properties
+    sim_with_units.properties['boxsize'] = 1000 * units.kpc
+    
+    # a unitbase in properties, related to the distance and velocity units, 
+    sim_with_units.properties["time"] = 1.0 * units.kpc / (units.km / units.s)
+    
+    # test simarray in properties
+    prop_arr = pynbody.array.SimArray(1.0, units.kpc)
+    prop_arr.sim = sim_with_units
+    sim_with_units.properties["prop"] = prop_arr
+
+    sim_with_units.set_units_system(distance="Mpc")
+    # from "1000 kpc" to "1000 Mpc"
+    assert sim_with_units.properties['boxsize'] == 1000 * units.Mpc
+    
+    # from "1.0 kpc / (km/s)" to "1.0 Mpc / (km/s)"
+    assert sim_with_units.properties["time"] == 1.0 * units.Mpc / (units.km / units.s)
+    
+    # from arr(1, kpc) to arr(1, Mpc)
+    assert sim_with_units.properties["prop"].units == units.Mpc
+    np.testing.assert_allclose(sim_with_units.properties["prop"], 1.0)
+
+
+# Whether a snapshot holds all the particles in its file matters to any code which identifies particles by
+# their position within that file; see SimSnap.is_partially_loaded and pynbody.halo.HaloCatalogue.
+
+def test_is_partially_loaded_when_fully_loaded():
+    full = pynbody.load("testdata/gasoline_ahf/g15784.lr.01024")
+    assert not full.is_partially_loaded()
+
+
+def test_is_partially_loaded_with_take():
+    partial = pynbody.load("testdata/gasoline_ahf/g15784.lr.01024", take=slice(0, 100))
+    assert partial.is_partially_loaded()
+
+
+@pytest.mark.parametrize("make_view", [lambda f: f[:100],
+                                       lambda f: f[np.array([5, 2, 100])],
+                                       lambda f: f.dm,
+                                       lambda f: f[:100].dm],
+                         ids=["slice", "index-list", "family", "family-of-slice"])
+def test_is_partially_loaded_for_views(make_view):
+    """A view holds only some of the file's particles, however it was constructed"""
+    full = pynbody.load("testdata/gasoline_ahf/g15784.lr.01024")
+    assert make_view(full).is_partially_loaded()
+
+
+def test_is_partially_loaded_for_new_snapshot():
+    """A snapshot which was never loaded from a file has all the particles there are"""
+    assert not pynbody.new(dm=100).is_partially_loaded()
+
+
+def test_is_partially_loaded_for_ramses_cpu_selection():
+    """Ramses partially loads by selecting whole cpu files rather than by taking particles"""
+    pynbody.test_utils.ensure_test_data_available("ramses")
+    path = "testdata/ramses/ramses_new_format_cosmo_with_ahf_output_00110"
+
+    assert not pynbody.load(path).is_partially_loaded()
+    assert pynbody.load(path, cpus=[1]).is_partially_loaded()
+
+
+@pytest.mark.parametrize("kwargs", [{"with_gas": False}, {"maxlevel": 1}],
+                         ids=["with_gas", "maxlevel"])
+def test_is_partially_loaded_for_ramses_gas_selection(kwargs):
+    """Dropping or truncating the AMR cells leaves out particles the halo finder knows about"""
+    pynbody.test_utils.ensure_test_data_available("ramses")
+    path = "testdata/ramses/ramses_new_format_cosmo_with_ahf_output_00110"
+
+    partial = pynbody.load(path, **kwargs)
+    assert len(partial.gas) < len(pynbody.load(path).gas)
+    assert partial.is_partially_loaded()
+
+
+def test_is_partially_loaded_for_copy_on_access():
+    """A copy-on-access wrapper holds exactly what it wraps, so it inherits its partial-loading status"""
+    from pynbody.snapshot.copy_on_access import CopyOnAccessSimSnap
+
+    full = pynbody.load("testdata/gasoline_ahf/g15784.lr.01024")
+
+    assert not CopyOnAccessSimSnap(full).is_partially_loaded()
+
+    wrapped_view = CopyOnAccessSimSnap(full[:100])
+    assert wrapped_view.is_partially_loaded()
+    assert wrapped_view[:10].is_partially_loaded()
+
+
+def test_is_partially_loaded_for_one_file_of_a_set():
+    """Opening a single file of a multi-file snapshot gives only the particles in that file"""
+    pynbody.test_utils.ensure_test_data_available("swift")
+
+    assert not pynbody.load("testdata/SWIFT/multifile_without_vds/snap_0000").is_partially_loaded()
+    assert pynbody.load("testdata/SWIFT/multifile_without_vds/snap_0000.2.hdf5").is_partially_loaded()

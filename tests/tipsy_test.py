@@ -212,6 +212,39 @@ def test_write_noncosmo(test_noncosmo_output):
     assert f3.properties['a']==12
 
 
+def test_time_roundtrip_noncosmological(tmp_path):
+    # regression test for https://github.com/pynbody/pynbody/issues/996
+    #
+    # A non-cosmological tipsy snapshot's properties['time'] is stored on disk as a raw
+    # value in the simulation's internal time unit. On load, pynbody represents it as a
+    # SimArray carrying that raw value with the paramfile-inferred unit attached (the
+    # same representation used for any other time-valued array, e.g. star['tform']), so
+    # that a plain float() of it -- and hence a subsequent write -- recovers the original
+    # header value, while .in_units(...) still gives the physical value.
+    (tmp_path / "sim.param").write_text("dKpcUnit = 1000\ndMsolUnit = 1e15\nbComove = 0\n")
+
+    f = pynbody.new(gas=10)
+    f['pos'] = np.random.rand(10, 3)
+    f['vel'] = np.random.rand(10, 3)
+    f['mass'] = np.ones(10)
+    f.properties['time'] = 12.0
+
+    orig_filename = str(tmp_path / "orig.tipsy")
+    f.write(fmt=pynbody.snapshot.tipsy.TipsySnap, filename=orig_filename, cosmological=False)
+
+    f2 = pynbody.load(orig_filename)
+    assert isinstance(f2.properties['time'], pynbody.array.SimArray)
+    assert f2.properties['time'] == f2._header_t
+    original_time_gyr = f2.properties['time'].in_units('Gyr')
+
+    roundtrip_filename = str(tmp_path / "roundtrip.tipsy")
+    f2.write(fmt=pynbody.snapshot.tipsy.TipsySnap, filename=roundtrip_filename, cosmological=False)
+    f3 = pynbody.load(roundtrip_filename)
+
+    npt.assert_allclose(f3._header_t, f2._header_t)
+    npt.assert_allclose(f3.properties['time'].in_units('Gyr'), original_time_gyr)
+
+
 def test_array_write(snap):
     f = snap
     f['array_write_test'] = np.random.rand(len(f))
@@ -429,3 +462,20 @@ def test_load_without_paramfile(no_paramfile_snap):
         f = pynbody.load(no_paramfile_snap)
         assert isinstance(f, pynbody.snapshot.tipsy.TipsySnap)
         assert len(f) == 1717156
+
+@pytest.fixture
+def DMO_snap():
+    f = pynbody.new(dm=100)
+    f.properties['a'] = 0
+    f.properties['time'] = 0
+    f.write(fmt=pynbody.snapshot.tipsy.TipsySnap, filename="testdata/dm_only.tipsy")
+    del f
+    yield pynbody.load("testdata/dm_only.tipsy")
+    for fname in glob.glob("testdata/dm_only.tipsy*"):
+        os.unlink(fname)
+
+@pytest.mark.filterwarnings("ignore:No readable param file.*:RuntimeWarning")
+@pytest.mark.filterwarnings("ignore:invalid value encountered in cast:RuntimeWarning")
+def test_shared_memory_DM(DMO_snap):
+    DMO_snap.enable_shared_arrays()
+    DMO_snap._load_main_file() # This will fail as per issue #983
